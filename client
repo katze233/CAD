@@ -1,0 +1,1073 @@
+99 poblem
+classdef GenericClient < handle
+    %GENERICCLIENT communicates with the transport using either ChannelClient
+    % or TransportClient. It also supports callback functions to notify the
+    % users that data is available to be read from the AsyncIO input buffer.
+
+    % Copyright 2019-2024 The MathWorks, Inc.
+
+    properties
+        % Flag to translate the error messages in the setProperty method,
+        % instead of using the original error messages thrown by the
+        % respective transport, ChannelClient, or TransportClient. The
+        % error messages are translated by default.
+        TranslateSetPropertyError (1, 1) logical = true
+
+        % Flag to append connection error troubleshooting doc link to the
+        % original connection error messages. The doc link is appended by
+        % default.
+        ErrorMessageLink (1, 1) logical = true
+    end
+
+    properties (SetAccess = private, Dependent)
+        % Flag that indicates whether the underlying client
+        % (ChannelClient or TransportClient) is connected.
+        ClientConnected
+    end
+    
+    properties(Access = protected)
+        % Handles ASCII terminated communication (writeline, readline, and
+        % writeread) and binblock communication (readbinblock and
+        % writebinblock).
+        ClientImpl
+
+        % Callback function for an error occurred event.
+        % Read/Write Access - Both
+        % Valid Values - function_handle
+        ErrorOccurredFcn = function_handle.empty()
+
+        % Throws errors/warnings specific to the interface
+        UserNotificationHandler
+
+        % The handle to the customer facing interface object which is used
+        % as the 'src' for the user specified BytesAvailableFcn. E.g. for
+        % a user specified BytesAvailableFcn @callbackFcn(src, evt), the
+        % 'src' needs to be the customer facing interface instance.
+        CallbackSource
+
+        % Client of type TransportClient or ChannelClient
+        Client
+
+        % Callback function for BytesAvailable event
+        % Read/Write Access - Read-only
+        % Valid Values - any function_handle
+        BytesAvailableFcn = function_handle.empty()
+
+        % Sets read/write methods to have precision as compulsory.
+        PrecisionRequired (1, 1) logical
+
+        % Name displayed in place of the created customer interface object
+        % when error/warning messages are thrown.
+        % Example: if InterfaceObjectName = "t-name" the error message
+        % would look as follows:
+        % >> read(t,4,4,3)
+        % error:
+        % Invalid number of input arguments for 'read'. Valid syntaxes are
+        % DATA = read(t-name,COUNT)
+        % DATA = read(t-name,COUNT,PRECISION)
+        % Valid values - any char or string value
+        InterfaceObjectName (1, 1) string
+
+        % Name for the interface which will be used to generate interface specific
+        % connection error troubleshooting doc link.
+        % E.g. "tcpclient", "tcpserver", "serialport", "udppport"
+        % "visadev", "bluetooth", etc
+        InterfaceName (1, :) string
+
+        % Specifies the condition when the bytes available callback is to
+        % be fired:
+        %  a. when BytesAvailableFcnCount number of bytes are available to
+        %     be read, or
+        %  b. when the terminator is reached, or
+        %  c. disables BytesAvailable callback.
+        % Read/Write Access - Read-only
+        % Valid Values - "off", "byte", "terminator"
+        BytesAvailableFcnMode = "off"
+
+        % Contains examples of correct syntaxes for configureCallback.
+        ConfigureCallbackCorrectSyntax
+    end
+
+    properties(Access = {?instrument.internal.ITestable, ?matlabshared.transportlib.internal.client.GenericClient}, Dependent)
+        % Contains the value of LastCallbackIdx property of StringClient.
+        StringLastCallbackIdx
+
+        % For BytesAvailableFcnMode = "byte", the number of bytes in the input
+        % buffer that triggers BytesAvailableFcn.
+        % Read/Write Access - Read-only
+        BytesAvailableFcnCount
+
+        % Used for reading and writing binary, ASCII and token data from the
+        % AsyncIO Channel.
+        Transport
+    end
+    
+    properties(Hidden, Dependent)
+        % Show warnings instead of errors in case of a read timeout.
+        % true  - Issue read timeout warnings.
+        % false - Throw read timeout errors.
+        ShowReadWarnings
+    end    
+
+    properties(Hidden, Constant)
+        % Lists all the configureCallback modes.
+        ConfigureCallbackMode = struct('off', 1, 'terminator', 2, ...
+            'byte', 3)
+
+        % List of all precisions that are supported by the GenericClient
+        PrecisionOptions = ["single", "double", "int8", "uint8", ...
+            "int16", "uint16", "int32", "uint32", "int64", "uint64", "char", "string"]
+    end
+
+    %% Hook methods for some GenericClient consumers
+    methods (Access = protected)
+        function bytesAvailableFcnModeValidationHook(~, ~)
+        end
+
+        function bytesAvailableFcnCountValidationHook(~, ~)
+        end
+
+        function flushInputValidationHook(~, ~)
+        end
+
+        function dataAvailableInfo = byteAvailableInfoHook(obj, ~, evt)
+            dataAvailableInfo = matlabshared.transportlib.internal.ByteAvailableInfo( ...
+                obj.BytesAvailableFcnCount, evt.AbsTime);
+        end
+
+        function dataAvailableInfo = terminatorAvailableInfoHook(~, ~, evt)
+            dataAvailableInfo = matlabshared.transportlib.internal.TerminatorAvailableInfo( ...
+                evt.AbsTime);
+        end
+
+        function msg = getCustomErrorOccurredMessageHook(~, ex)
+            msg = ex.Message;
+        end
+    end
+
+    %% Getters and Setters
+    methods
+        function value = get.BytesAvailableFcnCount(obj)
+            value = obj.Client.BytesAvailableFcnCount;
+        end
+
+        function value = get.StringLastCallbackIdx(obj)
+            value = obj.ClientImpl.LastCallbackIdx;
+        end
+
+        function value = get.ShowReadWarnings(obj)
+            value = obj.ClientImpl.ShowReadWarnings;
+        end
+        
+        function set.StringLastCallbackIdx(obj, value)
+            obj.ClientImpl.LastCallbackIdx = value;
+        end
+
+        function transport = get.Transport(obj)
+            transport = obj.Client.Transport;
+        end
+
+        function value = getProperty(obj, name)
+            name = instrument.internal.stringConversionHelpers.str2char(name);
+            switch name
+                case {'BytesAvailableFcn', 'BytesAvailableFcnMode', 'BytesAvailableFcnCount', 'ErrorOccurredFcn'}
+                    value = obj.(name);
+                case {'Timeout'}
+                    value = obj.Client.(name);
+                case {'StringReadFcn', 'Terminator'}
+                    value = obj.ClientImpl.(name);
+                otherwise
+                    value = obj.Transport.(name);
+            end
+        end
+
+        function setProperty(obj, name, value)
+            if obj.TranslateSetPropertyError
+                setPropertiesWithTranslatedError(obj, name, value);
+            else
+                setPropertiesWithoutTranslatedError(obj, name, value);
+            end
+        end
+
+        function set.BytesAvailableFcnMode(obj, value)
+            try
+                validateattributes(value, {'char', 'string'}, {'nonempty'}, mfilename, 'BytesAvailableFcnMode');
+                value = validatestring(value, ["off", "byte", "terminator"], mfilename, 'BytesAvailableFcnMode');
+            catch mExcept
+               throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+            obj.BytesAvailableFcnMode = value;
+        end
+
+        function set.ShowReadWarnings(obj, value)
+            try
+                obj.ClientImpl.ShowReadWarnings = value;
+            catch mExcept
+                throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+        end
+
+        function set.BytesAvailableFcn(obj, value)
+            if isnumeric(value) && isempty(value)
+                obj.BytesAvailableFcn = function_handle.empty();
+            elseif isa(value, 'function_handle')
+                obj.BytesAvailableFcn = value;
+            else
+                mExcept = MException(message ...
+                    ('transportlib:client:InvalidBytesAvailableFcn'));
+                throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+        end
+
+        function set.BytesAvailableFcnCount(obj, value)
+            try
+                validateattributes(value,{'numeric'}, {'>',0, 'integer', 'scalar', 'finite', 'nonnan'},mfilename,'BytesAvailableFcnCount');
+                obj.Client.BytesAvailableFcnCount = value; %#ok<*MCSUP>
+            catch ex
+                mExcept = MException("transportlib:client:InvalidBytesAvailableFcnCount", ex.message);
+                throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+        end
+
+        function set.ErrorOccurredFcn(obj, value)
+            if isnumeric(value) && isempty(value)
+                obj.ErrorOccurredFcn = function_handle.empty();
+            elseif isa(value, 'function_handle')
+                obj.ErrorOccurredFcn = value;
+            else
+                mExcept = MException(message('transportlib:client:InvalidErrorOccurredFcn'));
+                throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+        end
+
+        function value = getCustomProperty(obj, name)
+            % Access custom properties on the AsyncIO Channel
+            value = getCustomProperty(obj.Client, name);
+        end
+
+        function execute(obj, command, options)
+            % Call the execute method of the Client
+            try
+                execute(obj.Client, command, options);
+            catch ex
+                throwAsCaller(ex);
+            end
+        end
+    end
+
+    %% Lifetime
+    methods
+        function obj = GenericClient(clientProperties)
+            if ~isa(clientProperties, "matlabshared.transportlib.internal.client.ClientProperties")
+                throw(MException(message ...
+                    ('transportlib:client:InvalidClientProperties')));
+            end
+
+            obj.PrecisionRequired = clientProperties.PrecisionRequired;
+
+            if isempty(clientProperties.ErrorRegistry)
+                errorRegistry = matlabshared.transportlib.internal.client.utility.ErrorRegistry;
+            else
+                errorRegistry = clientProperties.ErrorRegistry;
+            end
+
+            warningRegistry = clientProperties.WarningRegistry;
+
+            if clientProperties.InterfaceName == ""
+                throw(MException(message("transportlib:client:NoInterfaceName")));
+            end
+
+            % Stores the complete interface name provided 
+            obj.InterfaceName = clientProperties.InterfaceName;
+
+            % Set Client to TransportClient/ChannelClient
+            obj.Client = getClient(obj, clientProperties);
+
+            obj.CallbackSource = clientProperties.CallbackSource;
+
+            % CallbackSource needs to be the handle of the class
+            % which sets the BytesAvailableFcn. The BytesAvailableFcn
+            % is fired using this handle a source
+            if isempty(clientProperties.CallbackSource)
+               obj.CallbackSource = obj;
+            end
+
+            if clientProperties.InterfaceObjectName == ""
+                throw(MException(message("transportlib:client:NoInterfaceObjectName")));
+            end
+
+            obj.InterfaceObjectName = clientProperties.InterfaceObjectName;
+
+            obj.UserNotificationHandler = matlabshared.transportlib.internal.client.utility.UserNotificationHandler ...
+                (clientProperties.InterfaceName, clientProperties.InterfaceObjectName, errorRegistry, warningRegistry, obj.PrecisionRequired);
+
+            obj.ClientImpl = matlabshared.transportlib.internal.client.ClientImpl(obj.Transport, obj.UserNotificationHandler);
+
+            obj.Transport.ErrorOccurredFcn = @obj.errorCallbackFunction;
+            obj.setConfigureCallbackCorrectSyntax();
+        end
+
+        function delete(obj)
+            obj.ClientImpl = [];
+            obj.UserNotificationHandler = [];
+            obj.Client = [];
+        end
+    end
+
+    %% API
+    methods
+        function connect(obj, varargin)
+            narginchk(1, 2)
+            
+            try
+                obj.Client.connect(varargin{:});
+            catch ex
+                mExcept = obj.UserNotificationHandler.translateErrorId(ex);
+                if obj.ErrorMessageLink
+                    % Returns connection mException with troubleshooting doc link appended
+                    mExcept = matlabshared.transportlib.internal.client.GenericClient.throwConnectionError(obj.InterfaceName, mExcept);
+                end
+                throwAsCaller(mExcept);
+            end
+            obj.Transport.AllowPartialReads = true;
+        end
+
+        function disconnect(obj)
+            obj.Client.disconnect();
+        end
+
+        function editInputArgsSyntax(obj, varargin)
+            % Make updates (add or edit) to the existing
+            % ValidInputArgsSyntax registry.
+            %
+            % Name - Name of the function to add/edit, e.g. "read".
+            %
+            % Value - Function signature for the function being refered to in
+            % "Name".
+
+            obj.UserNotificationHandler.editInputArgsSyntax(obj, varargin{:});
+        end
+
+        function val = getInputArgsSyntax(obj)
+            % Get the ValidInputArgsSyntax struct containing method names
+            % and their respective function signatures.
+
+            val = obj.UserNotificationHandler.editInputArgsSyntax(obj);
+        end
+
+        function flush(obj, varargin)
+            %FLUSH Clear the input buffer, output buffer, or both, based
+            % on the value of BUFFER.
+            %
+            %   FLUSH(OBJ) clears both the input and output buffers.
+            %
+            %   FLUSH(OBJ,BUFFER) clears the transport input buffer or output
+            %   buffer, based on the value of BUFFER.
+            %
+            %   Input Arguments:
+            %       BUFFER is the type of buffer that needs to be flushed.
+            %       Accepted Values - "input", "output".
+            %
+            %   Example:
+            %       % Flush the input buffer
+            %       flush(obj,"input");
+            %
+            %       % Flush the output buffer
+            %       flush(obj,"output");
+            %
+            %       % Flush both the input and output buffers
+            %       flush(obj);
+
+            try
+                narginchk(1, 2);
+            catch
+                obj.UserNotificationHandler.throwNarginErrorPlural('flush');
+            end
+
+            try
+                if nargin == 1
+                    % No value passed to buffer, flush both input and
+                    % output.
+                    flushInput(obj.Transport);
+                    obj.StringLastCallbackIdx = 0;
+                    flushOutput(obj.Transport);
+                else
+                    buffer = varargin{1};
+
+                    % Validate buffer to be either "input" or "output"
+                    flushInputValidationHook(obj, buffer);
+                    buffer = validatestring(varargin{1}, ["input", "output"], 'flush', 'buffer', 2);
+
+                    % flush input or output buffer.
+                    if buffer == "input"
+                        flushInput(obj.Transport);
+                        obj.StringLastCallbackIdx = 0;
+                    else
+                        flushOutput(obj.Transport);
+                    end
+                end
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function write(obj, varargin)
+            %WRITE Write data to the transport.
+            %   WRITE(OBJ,DATA,PRECISION) sends the 1xN matrix of data to
+            %   the transport. The data is cast to the specified
+            %   precision PRECISION regardless of the actual precision.
+            %
+            %   Input Arguments:
+            %       DATA is a 1xN matrix of numeric or ASCII data.
+            %
+            %       PRECISION controls the number of bits written for each value
+            %       and the interpretation of those bits as integer, floating-point,
+            %       or character values.
+            %       PRECISION must be one of 'CHAR','STRING','UINT8', 'INT8', 'UINT16',
+            %       'INT16', 'UINT32', 'INT32', 'UINT64', 'INT64', 'SINGLE', or
+            %       'DOUBLE'.
+            %
+            %   Notes:
+            %       WRITE waits until the requested number of values are
+            %       written to the transport.
+            %
+            %   Example:
+            %       % Writes 1, 2, 3, 4, 5 as uint8. (5*1 = 5 bytes total)
+            %       % to the transport.
+            %       write(obj,1:5,"uint8");
+
+            if ~obj.PrecisionRequired
+                try
+                    narginchk(2, 3);
+                    if nargin == 2
+                        precision = 'uint8';
+                    else
+                        precision = varargin{2};
+                    end
+                catch
+                    obj.UserNotificationHandler.throwNarginErrorPlural('write');
+                end
+            else
+                try
+                    narginchk(3, 3);
+                    precision = varargin{2};
+                catch
+                    obj.UserNotificationHandler.throwNarginErrorSingular('write');
+                end
+            end
+
+            try
+                data = varargin{1};
+                write(obj.Transport, data, precision);
+            catch ex
+                throwAsCaller(ex);
+            end
+        end
+
+        function data = read(obj, varargin)
+            %READ Read data from the transport.
+            %
+            %   DATA = READ(OBJ,COUNT,PRECISION) reads the specified
+            %   number of values, COUNT, with the specified precision,
+            %   PRECISION, from the device connected to the
+            %   transport, OBJ, and returns to DATA. For numeric PRECISION
+            %   types DATA is represented as a DOUBLE array in row format.
+            %   For char and string PRECISION types, DATA is represented as
+            %   is.
+            %
+            %   Input Arguments:
+            %       COUNT indicates the number of items to read. COUNT cannot be
+            %       set to INF or NAN. If COUNT is greater than the
+            %       NumBytesAvailable property of OBJ, then this function
+            %       waits until the specified amount of data is read or a
+            %       timeout occurs.
+            %
+            %       PRECISION indicates the number of bits read for each value
+            %       and the interpretation of those bits as a MATLAB data type.
+            %       PRECISION must be one of 'UINT8', 'INT8', 'UINT16',
+            %       'INT16', 'UINT32', 'INT32', 'UINT64', 'INT64', 'SINGLE',
+            %       'DOUBLE', 'CHAR', or 'STRING'.
+            %
+            %   Output Arguments:
+            %       DATA is a 1xN matrix of numeric or ASCII data. If no data
+            %       was returned, this is an empty array.
+            %
+            %   Note:
+            %       READ waits until the requested number of values are read
+            %       from the transport.
+            %
+            %   Example:
+            %       % Read 5 count of data as "uint32" (5*4 = 20 bytes).
+            %       data = read(obj,5,"uint32");
+
+            if ~obj.PrecisionRequired
+                try
+                    narginchk(2, 3);
+                    if nargin == 2
+                        precision = 'uint8';
+                    else
+                        precision = varargin{2};
+                    end
+                catch
+                    obj.UserNotificationHandler.throwNarginErrorPlural('read');
+                end
+            else
+                try
+                    narginchk(3, 3);
+                    precision = varargin{2};
+                catch
+                    obj.UserNotificationHandler.throwNarginErrorSingular('read');
+                end
+            end
+
+            try
+                count = varargin{1};
+                validateattributes(count, {'numeric'}, {'integer', 'nonzero'}, mfilename, 'count', 2);
+                data = read(obj.Transport, count, precision);
+                if precision == "string"
+                    dataConverted = char(data);
+                else
+                    dataConverted = data;
+                end
+
+                if length(dataConverted) < count
+                    handleReadTimeout(obj, dataConverted);
+                end
+
+                % If data is a numeric type, represent the data as an array
+                % of doubles.
+                data = obj.convertNumericToDouble(data, precision);
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+            
+            function handleReadTimeout(obj, dataConverted)
+                % Throw timeout error or issue a timeout warning depending
+                % on the ShowReadWarnings flag.
+                if obj.ShowReadWarnings
+                    obj.UserNotificationHandler.displayReadWarning(dataConverted, 'Read');
+                else
+                    throw(MException(message('transportlib:client:ReadTimeout')));
+                end
+            end
+        end
+
+        function configureCallback(obj, varargin)
+            %CONFIGURECALLBACK Set the BytesAvailable properties:
+            %
+            %   CONFIGURECALLBACK(OBJ,MODE) - For this syntax, the only
+            %   possible value for MODE is "off". This turns the BytesAvailable
+            %   callbacks off.
+            %
+            %   CONFIGURECALLBACK(OBJ,MODE,CALLBACKFCN) - For this syntax,
+            %   the only possible value for MODE is "terminator". This sets the
+            %   BytesAvailableFcnMode property to "terminator". CALLBACKFCN
+            %   is the function handle that is assigned to BytesAvailableFcn.
+            %   CALLBACKFCN is triggered whenever a terminator is available
+            %   to be read.
+            %
+            %   CONFIGURECALLBACK(OBJ,MODE,COUNT,CALLBACKFCN) - For this
+            %   syntax, the only possible value for MODE is "BYTE". This sets
+            %   the BytesAvailableFcnMode property to "BYTE". CALLBACKFCN is
+            %   the function handle that is assigned to BytesAvailableFcn.
+            %   CALLBACKFCN is triggered whenever COUNT number of bytes are
+            %   available to be read. BytesAvailableFcnCount is set to COUNT.
+            %
+            %   Input Arguments:
+            %       MODE: The BytesAvailableFcnMode. Possible values are "off",
+            %       "terminator", and "byte".
+            %
+            %       COUNT: The BytesAvailableFcnCount. This can be set to any
+            %       positive integer value. Valid only for MODE = "byte"
+            %
+            %       CALLBACKFCN: The BytesAvailableFcn. This can be set to a
+            %       function_handle.
+            %
+            %   Example:
+            %       % Turn the callback off
+            %       configureCallback(obj,"off")
+            %
+            %       % Set the BytesAvailableFcnMode to "terminator". This
+            %       % triggers the callback function "callbackFcn" when a
+            %       % terminator is available to be read.
+            %       configureCallback(obj,"terminator",@callbackFcn)
+            %
+            %       % Set the BytesAvailableFcnMode to "byte". This
+            %       % triggers the callback function "callbackFcn" when 50
+            %       % bytes of data are available to be read.
+            %       configureCallback(obj,"byte",50,@callbackFcn)
+
+            try
+                narginchk(2, 4);
+            catch
+                obj.UserNotificationHandler.throwNarginErrorPlural('configureCallback');
+            end
+
+            try
+                % convert to char in order to accept string datatype
+                varargin = instrument.internal.stringConversionHelpers.str2char(varargin);
+
+                % The BytesAvailableFcnMode.
+                mode = varargin{1};
+
+                bytesAvailableFcnModeValidationHook(obj, mode);
+                mode = validatestring(mode, {'terminator', 'byte', 'off'}, 'configureCallback', 'mode', 2);
+
+                % Validate that the mode is in accordance with the number
+                % of input arguments to configureCallback.
+                obj.validateBytesAvailableMode(mode, nargin);
+
+                obj.BytesAvailableFcnMode = mode;
+                switch mode
+                    case 'off'
+                        % Clear the data received listener
+                        clearIncomingDataListener(obj.Client);
+
+                        % Set the callback functions to empty.
+                        obj.Transport.BytesAvailableFcn = function_handle.empty();
+                        obj.ClientImpl.StringReadFcn = function_handle.empty();
+                        obj.BytesAvailableFcn = function_handle.empty();
+
+                    case 'terminator'
+                        fcnHandle = varargin{2};
+                        % 1. Start the Event Listenter for onDataReceived.
+                        % 2. Set the BytesAvailableFcnLocal to fcnHandle.
+                        % 3. Set the StringClient's StringReadFcn to the
+                        % custom handler function "callbackFunction".
+                        % 4. Set SingleCallbackMode to true.
+                        setIncomingDataListener(obj.Client);
+                        obj.BytesAvailableFcn = fcnHandle;
+                        obj.Transport.SingleCallbackMode = true;
+                        obj.ClientImpl.StringReadFcn = @obj.callbackFunction;
+
+                    case 'byte'
+                        count = varargin{2};
+                        fcnHandle = varargin{3};
+
+                        % 1. Start the Event Listenter for onDataReceived.
+                        % 2. Set the local BytesAvailableFcnCount to count
+                        % 3. Set the local BytesAvailableFcn to fcnHandle.
+                        % 4. Set SingleCallbackMode to false.
+                        % 5. Because mode = byte, set StringClient's
+                        %    StringReadFcn to empty.
+                        % 6. Set the Transport's BytesAvailableFcn to the
+                        % custom handler function "callbackFunction".
+                        setIncomingDataListener(obj.Client);
+
+                        % Validate the count
+                        bytesAvailableFcnCountValidationHook(obj, count);
+                        obj.BytesAvailableFcnCount = count;
+
+                        obj.BytesAvailableFcn = fcnHandle;
+                        obj.Transport.SingleCallbackMode = false;
+                        obj.ClientImpl.StringReadFcn = function_handle.empty();
+                        obj.Transport.BytesAvailableFcn = @obj.callbackFunction;
+                end
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function data = readline(obj, varargin)
+            %READLINE Read ASCII-terminated string data from the transport
+            %
+            %   DATA = READLINE(OBJ) reads until the first occurrence of the
+            %   terminator and returns the data back as a STRING. This
+            %   function waits until the terminator is reached or a
+            %   timeout occurs.
+            %
+            %   Output Arguments:
+            %       DATA is a string of ASCII data. If no data was returned,
+            %       this is an empty string.
+            %
+            %   Note:
+            %       READLINE waits until the terminator is read from the transport. 
+            %
+            %   Example:
+            %       % Reads all data up to the first occurrence of the
+            %       % terminator. Returns the data as a string with the
+            %       % terminator removed.
+            %       data = readline(obj);
+
+            try
+                data = readline(obj.ClientImpl, varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function data = readbinblock(obj, varargin)
+            %READBINBLOCK Read one binblock of data from the transport.
+            %
+            %   DATA = READBINBLOCK(OBJ) reads the binblock data as UINT8
+            %   and represents them as a DOUBLE array in row format.
+            %
+            %   DATA = READBINBLOCK(OBJ,PRECISION) reads the binblock data as
+            %   PRECISION type.For numeric PRECISION types DATA is
+            %   represented as a DOUBLE array in row format.
+            %   For char and string PRECISION types, DATA is
+            %   represented as is.
+            %
+            %   Input Arguments:
+            %       PRECISION indicates the number of bits read for each value
+            %       and the interpretation of those bits as a MATLAB data type.
+            %       DATATYPE must be one of "UINT8", "INT8", "UINT16",
+            %       "INT16", "UINT32", "INT32", "UINT64", "INT64", "SINGLE",
+            %       "DOUBLE", "CHAR", or "STRING".
+            %
+            %   Default PRECISION: "UINT8"
+            %
+            %   Output Arguments:
+            %       DATA is a 1xN matrix of numeric or ASCII data. If no data
+            %       was returned this is an empty array.
+            %
+            %   Notes:
+            %       READBINBLOCK waits until a binblock is read from the
+            %       transport.
+            %       READBINBLOCK REQUIRES INSTRUMENT CONTROL TOOLBOX™.
+            %
+            %   Example:
+            %       % Reads the raw bytes in the binblock as uint8, and
+            %       % represents them as a double array in row format.
+            %       data = readbinblock(obj);
+            %
+            %       % Reads the raw bytes in the binblock as uint16, and
+            %       % represents them as a double array in row format.
+            %       data = readbinblock(obj,"uint16")
+
+            try
+                data = obj.ClientImpl.readbinblock(varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function writeline(obj, varargin)
+            %WRITELINE Write ASCII data followed by the terminator to the
+            % transport.
+            %
+            %   WRITELINE(OBJ,DATA) writes the ASCII data, DATA, followed
+            %   by the terminator, to the transport.
+            %
+            %   Input Arguments:
+            %       DATA is the ASCII data that is written to the transport. This
+            %       DATA is always followed by the write terminator character(s).
+            %
+            %   Notes:
+            %       WRITELINE waits until the ASCII DATA followed by terminator
+            %       is written to the transport.
+            %
+            %   Example:
+            %       % writes "*IDN?" and adds the terminator to the end of
+            %       % the line before writing to the transport.
+            %       writeline(obj,"*IDN?");
+
+            try
+                writeline(obj.ClientImpl, varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function writebinblock(obj, varargin)
+            %WRITEBINBLOCK Write a binblock of data to the transport.
+            %
+            %   WRITEBINBLOCK(OBJ,DATA,PRECISION) writes DATA to the transport
+            %   using the binblock protocol (IEEE 488.2 Definite Length Arbitrary
+            %   Block Response Data). The data is cast to the specified precision
+            %   PRECISION regardless of the actual precision.
+            %
+            %   Input Arguments:
+            %       DATA is a 1xN matrix of numeric or ASCII data that is
+            %       written as a binblock to the transport.
+            %
+            %       PRECISION is of type "UINT8", "INT8", "UINT16",
+            %       "INT16", "UINT32", "INT32", "UINT64", "INT64", "SINGLE",
+            %       "DOUBLE", "CHAR", or "STRING".
+            %
+            %   Notes:
+            %       WRITEBINBLOCK waits until the binblock DATA is written
+            %       to the transport.
+            %       WRITEBINBLOCK REQUIRES INSTRUMENT CONTROL TOOLBOX™.
+            %
+            %   Example:
+            %       % Converts 1, 2, 3, 4, 5 to a binblock and writes it to
+            %       % the transport as uint8.
+            %       writebinblock(obj,1:5,"uint8");
+
+            try
+                writebinblock(obj.ClientImpl, varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function response = writeread(obj, varargin)
+            %WRITEREAD Write ASCII-terminated string COMMAND to transport and
+            % reads back an ASCII-terminated string RESPONSE.
+            % This function can be used to query an instrument connected to
+            % the transport.
+            %
+            %   RESPONSE = WRITEREAD(OBJ,COMMAND) writes the COMMAND
+            %   followed by the write terminator to the transport. It reads
+            %   back the RESPONSE from the transport, which is an ASCII
+            %   terminated string, and returns the RESPONSE after removing
+            %   the read terminator.
+            %
+            %   Input Arguments:
+            %       COMMAND: The terminated ASCII data that is written to the
+            %       transport
+            %
+            %   Output Arguments:
+            %       RESPONSE: The terminated ASCII data that is returned back
+            %       from the transport.
+            %
+            %   Notes:
+            %       WRITEREAD waits until the ASCII-terminated COMMAND is written
+            %       and an ASCII-terminated RESPONSE is retuned from the transport.
+            %       WRITEREAD REQUIRES INSTRUMENT CONTROL TOOLBOX™.
+            %
+            %   Example:
+            %       % Query the transport for a response by sending "IDN?"
+            %       % command.
+            %       response = writeread(obj,"*IDN?");
+
+            try
+                response = writeread(obj.ClientImpl, varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function configureTerminator(obj, varargin)
+            %CONFIGURETERMINATOR Set the Terminator property for ASCII
+            % terminated string communication on the transport.
+            %
+            %   CONFIGURETERMINATOR(OBJ,TERMINATOR) - Sets the Terminator
+            %   property to TERMINATOR for the interface object. TERMINATOR
+            %   applies to both Read and Write Terminators.
+            %
+            %   CONFIGURETERMINATOR(OBJ,READTERMINATOR,WRITETERMINATOR) -
+            %   Sets the Terminator property of the interface object to a cell
+            %   array of {READTERMINATOR,WRITETERMINATOR}. It sets the
+            %   Read Terminator to READTERMINATOR and the Write Terminator to
+            %   WRITETERMINATOR for the interface object.
+            %
+            %   Input Arguments:
+            %       TERMINATOR: The terminating character for as ASCII
+            %       terminated communication. This sets both Read and Write
+            %       Terminators to TERMINATOR.
+            %       Accepted Values - Integers ranging from 0 to 255
+            %                         "CR", "LF", "CR/LF"
+            %
+            %       READTERMINATOR: The read terminating character for as ASCII
+            %       terminated communication. This sets the Read Terminator to
+            %       READTERMINATOR.
+            %       Accepted Values - Integers ranging from 0 to 255
+            %                         "CR", "LF", "CR/LF"
+            %
+            %       WRITETERMINATOR: The write terminating character for as ASCII
+            %       terminated communication. This sets the write Terminator to
+            %       WRITETERMINATOR.
+            %       Accepted Values - Integers ranging from 0 to 255
+            %                         "CR", "LF", "CR/LF"
+            %
+            %   Example:
+            %       % Set both read and write terminators to "CR/LF"
+            %       configureTerminator(obj,"CR/LF")
+            %
+            %       % Set read terminator to "CR" and write terminator to
+            %       % ASCII value of 10
+            %       configureTerminator(obj,"CR",10)
+
+            try
+                configureTerminator(obj.ClientImpl, varargin{:});
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+
+        function value = getTotalElementsWritten(obj)
+            value = getTotalBytesWritten(obj.Transport);
+        end
+    end
+
+    %% Helper functions
+    methods (Access = protected)
+        function data = convertNumericToDouble(~, data, precision)
+            % This helper function represents numeric 'precision' type data
+            % as double for any read operation.
+
+            if precision ~= "string" && precision ~= "char"
+                data = double(data);
+            end
+        end
+
+        function validateBytesAvailableMode(obj, mode, numargs)
+            % This helper function checks for the proper formatting of the
+            % configureCallback function.
+
+            % If numargs == 2, this means the only possible
+            % BytesAvailableFcnMode is "off". Error for other cases.
+            % If numargs == 3, the only possibility of
+            % BytesAvailableFcnMode is "terminator". Error for other cases.
+            % If numargs == 4, the only possibility of
+            % BytesAvailableFcnMode is "byte". Error for other cases.
+
+            if (numargs == 2 && mode ~= "off") || ...
+                    (numargs == 3 && mode ~= "terminator") || ...
+                    (numargs == 4 && mode ~= "byte")
+
+                mExcept = MException(message ...
+                    ('transportlib:client:IncorrectBytesAvailableModeSyntax', ...
+                    obj.ConfigureCallbackCorrectSyntax ...
+                    {obj.ConfigureCallbackMode.(mode)}));
+                throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+            end
+        end
+
+        function callbackFunction(obj, src, evt)
+            % This is the callback function that gets fired whenever a bytes
+            % available callback event occurs. The BytesAvailableFcn
+            % contains the function handle for the specified callback
+            % function, set in configureCallback.
+
+            switch obj.BytesAvailableFcnMode
+                case "terminator"
+                    dataAvailableInfo = obj.terminatorAvailableInfoHook(src, evt);
+                case "byte"
+                    dataAvailableInfo = obj.byteAvailableInfoHook(src, evt);
+                otherwise
+                    % For the very rare case where the callbackFunctions
+                    % are queued, but the mode is set to "off" by the user.
+                    return
+            end
+
+            % Fire the user callback function
+            obj.BytesAvailableFcn(obj.CallbackSource, dataAvailableInfo);
+        end
+
+        function errorCallbackFunction(obj, ~, ex)
+            % Calls the user defined callback function for an error occurred event
+
+            if ~isempty(obj.ErrorOccurredFcn)
+                obj.ErrorOccurredFcn(ex);
+            else
+                % If Message field is args list(e.g. cell array), obtain
+                % message text from message catalog. Otherwise, print the
+                % Message text directly
+                if iscell(ex.Message)
+                    msg = message(ex.ID, ex.Message{:}).string;
+                else
+                    msg = getCustomErrorOccurredMessageHook(obj, ex);
+                end
+
+                fprintf(2, "%s\n", msg);
+            end
+        end
+
+        function client = getClient(~, clientProperties)
+            % Uses the ClientFactory to create the client and returns the
+            % client.
+
+            if isa(clientProperties, "matlabshared.transportlib.internal.client.TransportProperties")
+                client = matlabshared.transportlib.internal.client.TransportClient(clientProperties);
+            else
+                client = matlabshared.transportlib.internal.client.ChannelClient(clientProperties);
+            end
+            if ~isa(client, "matlabshared.transportlib.internal.client.IClient")
+                throw(MException(message("transportlib:client:InvalidClient")));
+            end
+        end
+
+        function setConfigureCallbackCorrectSyntax(obj)
+            % Shows the correct syntaxes for configureCallback when
+            % throwing error messages
+
+            obj.ConfigureCallbackCorrectSyntax = {['configureCallback(', char(obj.InterfaceObjectName) ',"off")'], ...
+                ['configureCallback(', char(obj.InterfaceObjectName) ',"terminator",@callbackFcn)'], ...
+                ['configureCallback(', char(obj.InterfaceObjectName) ',"byte",count,@callbackFcn)']};
+        end
+
+        function setPropertiesWithTranslatedError(obj, name, value)
+            % Set the client properties, translating the error messages
+            % where applicable.
+            name = instrument.internal.stringConversionHelpers.str2char(name);
+            switch name
+                case {'BytesAvailableFcn', 'BytesAvailableFcnCount', 'BytesAvailableFcnMode'}
+                    mExcept = MException(message('transportlib:client:ReadOnlyProperty', ...
+                        name, 'configureCallback'));
+                    throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+                case 'ErrorOccurredFcn'
+                    obj.ErrorOccurredFcn = value;
+                case 'Timeout'
+                    try
+                        obj.Client.Timeout = value;
+                    catch ex
+                        mExcept = MException("transportlib:client:InvalidType", ex.message);
+                        throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+                    end
+                case {'StringReadFcn', 'Terminator'}
+                    obj.ClientImpl.(name) = value;
+                otherwise
+                    try
+                        obj.Transport.(name) = value;
+                    catch ex
+                        mExcept = MException("transportlib:client:InvalidType", ex.message);
+                        throw(obj.UserNotificationHandler.translateErrorId(mExcept));
+                    end
+            end
+        end
+
+        function setPropertiesWithoutTranslatedError(obj, name, value)
+            % Set the client properties without translating the error
+            % messages, unless specified in the ErrorRegistry in the
+            % UserNotificationHandler.
+            name = instrument.internal.stringConversionHelpers.str2char(name);
+            try
+                switch name
+                    case 'BytesAvailableFcnMode'
+                        obj.BytesAvailableFcnMode = value;
+                    case 'BytesAvailableFcnCount'
+                        obj.Transport.BytesAvailableEventCount = value;
+                    case 'ErrorOccurredFcn'
+                        obj.ErrorOccurredFcn = value;
+                    case 'Timeout'
+                        obj.Client.Timeout = value;
+                    case {'StringReadFcn', 'Terminator'}
+                        obj.ClientImpl.(name) = value;
+                    otherwise
+                        obj.Transport.(name) = value;
+                end
+            catch ex
+                throw(obj.UserNotificationHandler.translateErrorId(ex));
+            end
+        end
+    end
+
+    %% Getters and Setters
+    methods
+        function val = get.ClientConnected(obj)
+            val = obj.Transport.Connected;
+        end
+    end
+
+    methods(Static)
+        function mExcept = throwConnectionError(interfaceName, errorInput, varargin)
+            % Throws connection errors with troubleshooting doc link appended
+
+            % Retrieves troubleshooting doc link for the interface
+            docRef = instrument.internal.errorMessagesHelpers.getConnectErrorDocLink(interfaceName);
+
+            if isa(errorInput,"MException")
+                strComplete = string(errorInput.message) + newline + docRef;
+                mExcept = MException(errorInput.identifier, strComplete);
+            elseif isstring(errorInput) || ischar(errorInput)
+                % The assumption here is that errorInput is an error
+                % identifier
+                strComplete = string(getString(message(errorInput, varargin{:}))) + newline + docRef;
+                mExcept = MException(errorInput, strComplete);
+            end
+        end
+    end
+end
